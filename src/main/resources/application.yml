@@ -1,0 +1,244 @@
+# ==============================================================================
+# Section 7 configuration. Every value here is a security control, and each
+# comment states the requirement it satisfies so a later change can be checked
+# against Section 7 rather than against taste.
+# ==============================================================================
+spring:
+  application:
+    name: incident-platform
+
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 26MB
+
+  datasource:
+    # currentSchema pins the connection's search_path to the application schema.
+    # Without it a pooled connection that reset its search path would resolve an
+    # unqualified table name to public.<table> and either fail or, worse, read the
+    # wrong object. V9 makes this non-optional rather than tidy: it issues
+    # `REVOKE ALL ON SCHEMA public FROM PUBLIC` and grants incident_app nothing
+    # outside incident_platform, so an unqualified name is a privilege error, not
+    # a silent fallback. It covers JdbcTemplate/native SQL (the audit append call
+    # and IncidentSnapshotRepository) as well as JPA -- hibernate.default_schema
+    # below only qualifies the names Hibernate generates.
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5433/incident_platform?currentSchema=incident_platform}
+    # 7.16: a minimum-privilege role scoped to its own schema. Credentials come
+    # from the vault (7.8) at runtime, never from a committed file.
+    username: ${DATABASE_USERNAME:incident_app}
+    password: ${DATABASE_PASSWORD:${INCIDENT_APP_PASSWORD:}}
+    hikari:
+      maximum-pool-size: ${DATABASE_POOL_SIZE:20}
+      minimum-idle: 5
+      connection-timeout: 10000
+      # A validation query is required because Hikari's isValid() is not
+      # sufficient for every proxy/load-balancer in front of PostgreSQL.
+      connection-test-query: SELECT 1
+      pool-name: incident-platform-pool
+
+  jpa:
+    # Flyway owns the schema. Hibernate is set to validate rather than update
+    # so that a drift between the approved migrations and the database is a
+    # startup failure, not a silent ddl-auto rewrite of a schema that is
+    # append-only by design.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        default_schema: incident_platform
+        jdbc:
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+    # Reports the owning module of a lazy-loading failure. The alternative --
+    # leaving it on -- converts a broken lazy fetch into a silent N+1 query per
+    # request, which is a performance problem now and a data-exposure problem
+    # once a view forgets to apply property-level filtering inside a session.
+    properties.hibernate.generate_statistics: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    schemas: incident_platform
+    default-schema: incident_platform
+    # Keep schema ownership separate from the runtime datasource identity.
+    # Tests can omit these settings and reuse their datasource credentials.
+    user: ${FLYWAY_USERNAME:incident_migrator}
+    password: ${FLYWAY_PASSWORD:${INCIDENT_MIGRATOR_PASSWORD:${spring.datasource.password}}}
+    # V9 grants privileges to incident_app and fails closed if the role is
+    # absent, so a developer running against a local database without the role
+    # provisioned gets an explicit, documented error rather than a half-applied
+    # schema.
+    validate-on-migrate: true
+    clean-disabled: true
+    # 7.10: concurrent Flyway runs must not race on the history table.
+    connect-retries: 3
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # The decoder is built explicitly in SecurityConfig so the audience
+          # validator can be added; a bare issuer-uri here would accept any
+          # token minted by this realm for any other client.
+          issuer-uri: ${KEYCLOAK_ISSUER:http://localhost:8081/realms/incident-platform}
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Durability over latency for incident events: an ack of 1 would allow a
+      # broker failure to silently drop the notification that FR-2.5 requires.
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+  mail:
+    host: ${SMTP_HOST:localhost}
+    port: ${SMTP_PORT:1025}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: ${SMTP_AUTH:false}
+          starttls:
+            enable: ${SMTP_STARTTLS_ENABLE:false}
+          connectiontimeout: ${SMTP_CONNECTION_TIMEOUT_MS:5000}
+          timeout: ${SMTP_TIMEOUT_MS:5000}
+          writetimeout: ${SMTP_WRITE_TIMEOUT_MS:5000}
+
+server:
+  port: ${SERVER_PORT:8080}
+  # 7.5 secure error handling: never leak a stack trace or an internal message
+  # to a client. Stack traces go to the log, correlated by X-Request-Id.
+  error:
+    include-stacktrace: never
+    include-message: never
+    include-exception: false
+    include-binding-errors: never
+  # Trusting forwarded headers is a deployment decision, not a default. With it
+  # enabled and no reverse proxy actually in front, a client could forge its own
+  # source address in the audit log.
+  forward-headers-strategy: none
+  shutdown: graceful
+
+incident-platform:
+  # Full issuer URI. Section 6.2.1: this is the authority for identity and
+  # coarse role, and its value is what token signature, issuer and JWKS
+  # discovery are validated against. Per-environment (7.8), so a staging
+  # deployment can never accept tokens minted by a dev realm.
+  keycloak-issuer: ${KEYCLOAK_ISSUER:http://localhost:8081/realms/incident-platform}
+  api-client-id: ${KEYCLOAK_API_CLIENT_ID:incident-platform-api}
+  spa-client-id: ${KEYCLOAK_SPA_CLIENT_ID:incident-platform-spa}
+  # Explicit allow-list, never a wildcard. The SPA is a separate origin.
+  allowed-origins: ${SPA_ORIGINS:http://localhost:5173}
+  evidence:
+    # ClamAV is the default scanner. The heuristic requires both the offline-dev
+    # profile and an explicit scanner=heuristic override.
+    scanner: ${INCIDENT_PLATFORM_EVIDENCE_SCANNER:clamav}
+    clamav:
+      host: ${INCIDENT_PLATFORM_EVIDENCE_CLAMAV_HOST:localhost}
+      port: ${INCIDENT_PLATFORM_EVIDENCE_CLAMAV_PORT:3310}
+      connect-timeout-ms: ${INCIDENT_PLATFORM_EVIDENCE_CLAMAV_CONNECT_TIMEOUT_MS:3000}
+      read-timeout-ms: ${INCIDENT_PLATFORM_EVIDENCE_CLAMAV_READ_TIMEOUT_MS:30000}
+    max-file-size-bytes: ${INCIDENT_PLATFORM_EVIDENCE_MAX_FILE_SIZE_BYTES:26214400}
+    default-allowed-mime-types:
+      - image/png
+      - image/jpeg
+      - image/gif
+      - image/bmp
+      - image/webp
+      - application/pdf
+      - message/rfc822
+      - application/x-ole-storage
+      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+      - application/rtf
+      - text/plain
+    storage-root: ${INCIDENT_PLATFORM_EVIDENCE_STORAGE_ROOT:./var/evidence}
+  notifications:
+    email:
+      enabled: ${INCIDENT_PLATFORM_NOTIFICATIONS_EMAIL_ENABLED:false}
+      from: ${INCIDENT_PLATFORM_NOTIFICATIONS_EMAIL_FROM:no-reply@incident-platform.local}
+    kafka:
+      enabled: ${INCIDENT_PLATFORM_NOTIFICATIONS_KAFKA_ENABLED:false}
+    sla:
+      poll-interval-ms: ${INCIDENT_PLATFORM_NOTIFICATIONS_SLA_POLL_INTERVAL_MS:30000}
+  # 7.9: tokens are re-validated against current user state. A non-zero TTL
+  # trades a bounded amount of that immediacy for throughput; set to 0s to check
+  # the database on every request. Deliberate revocation through the
+  # application bypasses the TTL entirely via CurrentUserStateService.invalidate.
+  user-state-cache-ttl: ${USER_STATE_CACHE_TTL:30s}
+  # 7.2.1 "explicitly shared/grouped" is ambiguous. Default is the narrow
+  # reading; see GroupVisibilityPolicy.
+  group-visibility-policy: ${GROUP_VISIBILITY_POLICY:EXPLICIT_COLLABORATION_ONLY}
+  # 7.5: only enable behind a proxy that overwrites X-Forwarded-For.
+  trust-forwarded-for: ${TRUST_FORWARDED_FOR:false}
+  # 7.9 recommended access-token lifetime.
+  access-token-expected-lifetime: PT15M
+  # 7.9 absolute and idle session timeouts, enforced by Keycloak.
+  absolute-session-timeout: PT8H
+  idle-session-timeout: PT30M
+  # 7.1: "strongly recommended (configurable to required) for Reporters".
+  # Read by CurrentUserStateService.
+  reporter-mfa-required: ${REPORTER_MFA_REQUIRED:false}
+  required-acr: ${KEYCLOAK_REQUIRED_ACR:mfa}
+  identity:
+    # A validated, audience-checked Keycloak token is authoritative for the
+    # coarse role and current department projection. Disabled app_user rows are
+    # never reactivated through token synchronization.
+    token-projection-sync-enabled: ${IDENTITY_TOKEN_SYNC_ENABLED:true}
+    reconciliation:
+      # Requires a dedicated Keycloak service account with view-users and
+      # query-users rights. Disabled unless explicitly configured.
+      enabled: ${KEYCLOAK_IDENTITY_SYNC_ENABLED:false}
+      client-id: ${KEYCLOAK_IDENTITY_SYNC_CLIENT_ID:}
+      client-secret: ${KEYCLOAK_IDENTITY_SYNC_CLIENT_SECRET:}
+      page-size: ${KEYCLOAK_IDENTITY_SYNC_PAGE_SIZE:100}
+      max-users: ${KEYCLOAK_IDENTITY_SYNC_MAX_USERS:20000}
+      poll-interval-ms: ${KEYCLOAK_IDENTITY_SYNC_POLL_MS:300000}
+      initial-delay-ms: ${KEYCLOAK_IDENTITY_SYNC_INITIAL_DELAY_MS:120000}
+    dormancy:
+      enabled: ${IDENTITY_DORMANCY_ENABLED:true}
+      inactive-days: ${IDENTITY_DORMANCY_DAYS:90}
+      poll-interval-ms: ${IDENTITY_DORMANCY_POLL_MS:3600000}
+      initial-delay-ms: ${IDENTITY_DORMANCY_INITIAL_DELAY_MS:60000}
+  # How far ahead the scheduled job pre-creates audit partitions. Must exceed
+  # the maximum interval between runs, or appends will fail against a missing
+  # partition.
+  audit-partition-lookahead: PT30M
+  # Liveness only. Exposing env or configprops on an unauthenticated path would
+  # hand an attacker the datasource URL and the realm name.
+  actuator-unauthenticated-paths:
+    - /actuator/health/liveness
+    - /actuator/health/readiness
+
+audit:
+  # 7.11: retries before the failure is logged as permanently lost. Bounded, so
+  # a database outage cannot exhaust the request thread.
+  max-attempts: 3
+
+logging:
+  level:
+    root: INFO
+    com.company.incidentplatform: INFO
+    # Set to DEBUG locally only. Authorization decisions are logged at WARN/ERROR
+    # by the components that matter, not by Spring Security internals.
+    org.springframework.security: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{requestId:-}] %logger{36} - %msg%n"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+      base-path: /actuator
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never

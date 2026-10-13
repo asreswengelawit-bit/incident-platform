@@ -1,0 +1,146 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.16'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.company.incidentplatform'
+version = '0.1.0-SNAPSHOT'
+description = 'Cybersecurity Incident Reporting and Management Platform'
+
+repositories {
+    mavenCentral()
+}
+
+tasks.named('bootRun') {
+    // Load local Compose credentials for host-run development without adding
+    // secrets to the Gradle project or requiring manual PowerShell exports.
+    def localEnvFile = rootProject.file('../.env')
+    if (localEnvFile.isFile()) {
+        def localValues = [:]
+        localEnvFile.eachLine('UTF-8') { line ->
+            def entry = line.trim()
+            if (!entry.isEmpty() && !entry.startsWith('#')) {
+                def separator = entry.indexOf('=')
+                if (separator > 0) {
+                    localValues[entry.substring(0, separator).trim()] =
+                            entry.substring(separator + 1).trim()
+                }
+            }
+        }
+
+        localValues.each { key, value ->
+            if (System.getenv(key) == null) {
+                environment key, value
+            }
+        }
+        if (System.getenv('KEYCLOAK_ISSUER') == null && localValues.KEYCLOAK_PUBLIC_URL) {
+            environment 'KEYCLOAK_ISSUER',
+                    "${localValues.KEYCLOAK_PUBLIC_URL}/realms/incident-platform"
+        }
+        if (System.getenv('KEYCLOAK_JWK_SET_URI') == null) {
+            environment 'KEYCLOAK_JWK_SET_URI',
+                    'http://localhost:8081/realms/incident-platform/protocol/openid-connect/certs'
+        }
+        if (System.getenv('SERVER_PORT') == null) {
+            environment 'SERVER_PORT', '8082'
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+ext {
+    testcontainersVersion = '1.20.1'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // Section 5.2: Spring Security + Keycloak OIDC/OAuth2. Resource-server
+    // (JWT validation) rather than client, because the SPA holds the token and
+    // the API is a stateless pod (Section 4 Scalability).
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-oauth2-resource-server'
+
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    // Section 5.1/5.4: lifecycle events are written to an outbox and relayed
+    // through Kafka to the notification consumer.
+    implementation 'org.springframework.kafka:spring-kafka'
+    implementation 'org.springframework.boot:spring-boot-starter-mail'
+
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+
+    // Section 10 Testing
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+    testImplementation "org.testcontainers:junit-jupiter:${testcontainersVersion}"
+    testImplementation "org.testcontainers:postgresql:${testcontainersVersion}"
+    testImplementation "org.testcontainers:kafka:${testcontainersVersion}"
+}
+
+tasks.named('test') {
+    useJUnitPlatform {
+        // Unit tests must not require Docker. Testcontainers-based integration
+        // tests are selected by the separate `integrationTest` task below.
+        excludeTags 'integration'
+    }
+
+    // Section 7.1 / 7.9: the Keycloak realm export is an input to the test task,
+    // not just a file it happens to read at runtime.
+    //
+    // RealmSecurityConfigTest asserts the shipped realm still carries
+    // passwordHistory(10), an incremental brute-force wait, and the per-client
+    // token TTLs. Without declaring the file here, Gradle's up-to-date check
+    // considers `test` unchanged after a realm edit and skips it entirely -- so
+    // the guard silently stops guarding exactly when someone changes the config
+    // it exists to police. Declaring the input is what makes editing the realm
+    // re-run the check that the edit did not weaken a control.
+    inputs.file(layout.projectDirectory.file('../keycloak/realm/incident-platform-realm.json'))
+        .withPropertyName('keycloakRealmExport')
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+/**
+ * Section 7.11 audit path against a real PostgreSQL 17 with the real migrations
+ * applied. Split out from `test` because it needs a Docker engine and is
+ * comparatively slow, but it is NOT optional in CI: it is the only test that
+ * exercises audit_log_append against a database, and a misaligned pair of
+ * adjacent text parameters there would insert a plausible but wrong row rather
+ * than failing.
+ *
+ * Run with:  ./gradlew integrationTest
+ */
+tasks.register('integrationTest', Test) {
+    description = 'Runs @Tag("integration") tests. Requires a running Docker engine.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'integration'
+    }
+    shouldRunAfter tasks.named('test')
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('test')
+}
